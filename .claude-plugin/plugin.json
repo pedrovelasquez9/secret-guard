@@ -1,0 +1,21 @@
+{
+  "name": "secret-guard",
+  "version": "1.3.0",
+  "author": {
+    "name": "Programación en español",
+    "url": "https://github.com/pedrovelasquez9"
+  },
+  "description": "Detecta patrones de secretos en llamadas cubiertas, enmascara resultados y muestra incidencias en un panel de revisión.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "allowedRules": {
+      "type": "string",
+      "title": "Reglas permitidas",
+      "description": "Ids de reglas que una persona desactiva a propósito, separados por comas (p. ej. google-api-key para el apiKey público de Firebase). Vacío: todas activas.",
+      "default": ""
+    }
+  },
+  "homepage": "https://github.com/pedrovelasquez9/secret-guard#readme",
+  "repository": "https://github.com/pedrovelasquez9/secret-guard",
+  "license": "MIT"
+}

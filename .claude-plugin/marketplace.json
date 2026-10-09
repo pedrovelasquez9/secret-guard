@@ -1,0 +1,14 @@
+{
+  "name": "secret-guard",
+  "owner": {
+    "name": "Programación en español",
+    "url": "https://github.com/pedrovelasquez9"
+  },
+  "plugins": [
+    {
+      "name": "secret-guard",
+      "source": "./"
+    }
+  ],
+  "description": "Detección y revisión visual de patrones de secretos en Claude Code"
+}

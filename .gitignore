@@ -1,0 +1,10 @@
+# Local development files; keep .claude-plugin/types versioned
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
+
+# Generated from the connectors of the machine that loaded the mod: private, never publish
+.claude-plugin/types/claude-code-mcp/
