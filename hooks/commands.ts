@@ -1,47 +1,107 @@
-/** Deliberately bounded shell subset. Unsupported shipping syntax is refused. */
-export type GitCall = { action: string; args: string[]; cwd: string; options: string[] }
-export const words = (text: string): string[] => {
-  const matches = text.match(/"(?:[^"\\]|\\.)*"|'[^']*'|[^\s]+/g) ?? []
-  return matches.map((s) => s.replace(/^(["'])(.*)\1$/, '$2'))
-}
+/**
+ * Deliberately bounded shell subset (Bash and PowerShell). What it cannot follow is
+ * recorded as the call's `problem`: it refuses a commit or push, never a read-only command.
+ */
+export type GitCall = { action: string; args: string[]; cwd: string; options: string[]; problem?: string }
+
+// PowerShell here-strings and quoted strings are single, opaque words.
+const QUOTED = String.raw`@(['"])\r?\n[\s\S]*?\r?\n\1@|"(?:[^"\\]|\\.)*"|'[^']*'`
+export const words = (text: string): string[] =>
+  (text.match(new RegExp(`${QUOTED}|[^\\s]+`, 'g')) ?? []).map((s) =>
+    s.replace(/^@(['"])\r?\n([\s\S]*?)\r?\n\1@$/, '$2').replace(/^(["'])([\s\S]*)\1$/, '$2'),
+  )
+
 export const resolveDir = (base: string, dir: string) => {
   if (/[$`~]/.test(dir)) throw new Error('Dynamic directory is not inspectable')
+  // Git Bash spells C:\x as /c/x; the host process needs the Windows form.
+  const msys = /^\/([A-Za-z])(?=\/|$)/.exec(dir)
+  if (msys && /^[A-Za-z]:/.test(base)) return `${msys[1]!.toUpperCase()}:${dir.slice(2) || '/'}`
   if (/^(?:[A-Za-z]:[\\/]|\/)/.test(dir)) return dir
   return `${base.replace(/[\\/]$/, '')}/${dir}`
 }
+
+/** A heredoc body is data, not commands or words: drop it (an unterminated one is kept). */
+const dropHeredocs = (text: string) => {
+  let out = text
+  let from = 0
+  for (;;) {
+    const m = /<<-?\s*(['"]?)([A-Za-z_][\w.-]*)\1/.exec(out.slice(from))
+    if (!m) return out
+    const start = from + m.index
+    const lineEnd = out.indexOf('\n', start)
+    const body = lineEnd < 0 ? null : new RegExp(String.raw`\n[\t ]*${m[2]!.replace(/[.-]/g, '\\$&')}[\t ]*(?:\r?\n|$)`).exec(out.slice(lineEnd))
+    if (!body) {
+      from = start + m[0].length
+      continue
+    }
+    out = out.slice(0, start) + out.slice(start + m[0].length, lineEnd + 1) + out.slice(lineEnd + body.index + body[0].length)
+    from = start
+  }
+}
+
+// Git subcommands that never ship content: a parse problem in them is not worth a block.
+const NON_SHIPPING = new Set(
+  ('status log diff show branch fetch pull remote config rev-parse rev-list ls-files ls-remote ls-tree grep blame ' +
+    'describe tag stash checkout switch restore reset init clone merge rebase cherry-pick revert version help ' +
+    'cat-file for-each-ref reflog shortlog worktree clean mv rm apply am bisect archive gc fsck show-ref ' +
+    'symbolic-ref check-ignore var name-rev count-objects range-diff format-patch sparse-checkout maintenance').split(' '),
+)
+export const isNonShipping = (action: string) => NON_SHIPPING.has(action)
+
+// A `-c` that changes where or how a push goes would make the inspection look elsewhere.
+const DESTINATION_CONFIG = /^(?:remote|url|push|branch|alias)\.|^core\.(?:sshcommand|hookspath)=/i
+const PASS_OPTIONS = ['--no-pager', '--paginate', '-p', '--no-optional-locks', '--no-replace-objects', '--literal-pathspecs', '--noglob-pathspecs', '--icase-pathspecs']
+
 export function gitCalls(command: string, cwd: string): GitCall[] {
   // Quoted text is opaque: a `;`, `|` or `&&` inside a commit message must not split the
   // command (it would turn message words into commit paths and narrow the scan).
   const quoted: string[] = []
-  const masked = command.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, (q) => `\u0000${quoted.push(q) - 1}\u0000`)
+  const masked = dropHeredocs(command).replace(new RegExp(QUOTED, 'g'), (q) => `\u0000${quoted.push(q) - 1}\u0000`)
   // Drop redirections before splitting, so 2>&1 cannot become a ref or separator.
   const clean = masked.replace(/\d*\s*(?:>>?|<)\s*(?:&\d+|[^\s;&|]+)/g, '')
   const chunks = clean
-    .split(/\s*(?:&&|;|\|\||\|)\s*/)
+    .split(/\s*(?:&&|;|\|\||\||\r?\n)\s*/)
     .map((chunk) => chunk.replace(/\u0000(\d+)\u0000/g, (_, i: string) => quoted[Number(i)] ?? ''))
   const calls: GitCall[] = []
+  // A directory change we cannot follow leaves every later call's directory unknown.
+  let lost: string | undefined
   for (const chunk of chunks) {
     const args = words(chunk)
+    if (args[0] === '&') args.shift() // PowerShell call operator: `& git push`
     const executable = (args.shift() ?? '').replaceAll('\\', '/').split('/').pop()?.toLowerCase()
-    if (['cd', 'chdir', 'set-location'].includes(executable ?? '')) {
-      if (chunks.length === 1) continue
-      if (args.length !== 1 || !clean.includes('&&'))
-        throw new Error('Use a separate directory change before shipping')
-      cwd = resolveDir(cwd, args[0]!)
+    if (['cd', 'chdir', 'set-location', 'sl', 'pushd'].includes(executable ?? '')) {
+      const target = args.filter((a) => !a.startsWith('-')) // Set-Location -Path X
+      if (target.length !== 1) lost = 'Use a simple directory change before shipping'
+      else
+        try {
+          cwd = resolveDir(cwd, target[0]!)
+        } catch (error) {
+          lost = (error as Error).message
+        }
       continue
     }
     if (executable !== 'git' && executable !== 'git.exe') continue
     let dir = cwd
+    let problem = lost
     const options: string[] = []
     while (args[0]?.startsWith('-')) {
       const option = args.shift()!
-      if (option === '-C') {
-        if (!args[0]) throw new Error('Missing directory')
-        dir = resolveDir(dir, args.shift()!)
-      } else if (['--no-pager', '--paginate', '--no-optional-locks'].includes(option)) options.push(option)
-      else throw new Error('Unsupported Git global option; use an explicit simple invocation')
+      if (option === '-C' || option === '-c') {
+        const value = args.shift()
+        if (value === undefined) problem ??= `Missing value for git ${option}`
+        else if (option === '-c' && DESTINATION_CONFIG.test(value))
+          problem ??= 'This git -c setting changes where the push goes; push without it'
+        else if (option === '-c') options.push(option, value)
+        else
+          try {
+            dir = resolveDir(dir, value)
+          } catch (error) {
+            problem ??= (error as Error).message
+          }
+      } else if (PASS_OPTIONS.includes(option)) options.push(option)
+      else problem ??= `Unsupported Git global option ${option}; use a simple invocation`
     }
-    calls.push({ action: args.shift() ?? '', args, cwd: dir, options })
+    calls.push({ action: args.shift() ?? '', args, cwd: dir, options, ...(problem ? { problem } : {}) })
   }
   return calls
 }
@@ -87,7 +147,7 @@ export function commitPlan(args: string[]) {
     if (/^-[^-]*m./.test(a)) continue
     if (a.startsWith('-')) {
       if (
-        !/^(?:-[am]+|-[mF].+|--(?:amend|no-edit|all|allow-empty|allow-empty-message|no-verify|quiet|verbose|signoff|no-gpg-sign)|--(?:message|author|date|trailer|fixup|squash)=.*)$/.test(
+        !/^(?:-[amnqsv]+|-[mF].+|-S.*|--(?:amend|no-edit|all|allow-empty|allow-empty-message|no-verify|verify|quiet|verbose|signoff|no-gpg-sign|gpg-sign|status|no-status|no-post-rewrite)|--(?:message|author|date|trailer|fixup|squash|cleanup|gpg-sign)=.*)$/.test(
           a,
         )
       )
@@ -119,7 +179,8 @@ export function pushPlan(args: string[]) {
     } else if (a.startsWith('--repo=')) remote = a.slice(7)
     else if (a.startsWith('-')) {
       if (
-        !/^(?:-u|-f|--force|--force-with-lease(?:=.*)?|--set-upstream|--atomic|--porcelain|--verbose|--quiet|--dry-run|--follow-tags|--no-verify|--push-option=.*)$/.test(
+        // Options that change neither which commits nor which destination are let through.
+        !/^(?:-[ufvqn46]+|--force|--force-with-lease(?:=.*)?|--force-if-includes|--no-force-with-lease|--set-upstream|--atomic|--no-atomic|--porcelain|--verbose|--quiet|--dry-run|--progress|--no-progress|--thin|--no-thin|--ipv4|--ipv6|--follow-tags|--no-follow-tags|--no-verify|--verify|--signed(?:=.*)?|--no-signed|--recurse-submodules=(?:no|check)|--no-recurse-submodules|--push-option=.*)$/.test(
           a,
         )
       )

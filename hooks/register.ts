@@ -1,4 +1,4 @@
-import { gitCalls, commitPlan, pushPlan, words, resolveDir, vercelDirectory } from './commands'
+import { gitCalls, commitPlan, pushPlan, words, resolveDir, vercelDirectory, isNonShipping } from './commands'
 import type { EngineInterface, Register } from 'claude-code'
 import { atom, read, update } from 'claude-code'
 import type { Incident } from '../types'
@@ -226,10 +226,17 @@ async function checkPush($: $, cwd: string, args: string[]): Promise<string[]> {
   if (urls.length > 1) throw new Error('Inspect each push URL separately')
   const url = urls[0] || remote
   // Network round trip: bounded on its own, and never prompts for credentials (GIT_ENV).
-  const advertised = await checkedGit($, cwd, ['ls-remote', '--refs', '--', url], 20_000)
+  const advertised = await git($, cwd, ['ls-remote', '--refs', '--', url], { timeoutMs: 20_000 }).catch(() => undefined)
+  // Unreachable destination (offline, an SSH key that needs a passphrase): the push would
+  // fail the same way. Fall back to what this repository last fetched from that remote, so
+  // a slow network never turns into "incomplete check". Commits it already had are public.
+  const known =
+    advertised && advertised.exitCode === 0 && !advertised.isStdoutTruncated
+      ? advertised.stdout
+      : (await checkedGit($, cwd, ['for-each-ref', '--format=%(objectname) %(refname)', `refs/remotes/${remote}/`])).stdout
   const hashes = [
     ...new Set(
-      advertised.stdout
+      known
         .split('\n')
         .map((l) => l.split(/\s/)[0]!)
         .filter((h) => /^[a-f0-9]{40,64}$/.test(h)),
@@ -512,8 +519,15 @@ const isSettingsFile = (path: string) => /^(?:settings(?:\.local)?|installed_plu
 const touchesGuard = (cmd: string) =>
   /\ballowedRules\b|\bpluginConfigs\b/.test(cmd) ||
   /\bplugin\b[^;&|]*\b(?:disable|uninstall|remove|update|install|config)\b[^;&|]*secret-guard|secret-guard[^;&|]*\b(?:disable|uninstall)\b/i.test(cmd)
-// Git reached through a wrapper (`sh -c "git push"`, `env X=1 git commit`) escapes the parser.
-const WRAPPED_GIT = /(?:^|[\s"'(;&|`])git(?:\.exe)?["']?(?:\s+-C\s+\S+|\s+-\S+)*\s+(?:commit|push)\b/i
+// Safety net: a `git commit`/`git push` in command position (start, after a separator, or
+// inside a wrapper such as `sh -c "…"` / `env X=1 …`) that the parser did not turn into a
+// call. Mentions inside strings (`grep "git push" README`) are not in command position.
+const SHIPPING_AT_COMMAND = new RegExp(
+  String.raw`(?:(?:^|[\n;&|(]\s*)|(?:^|[\s;&|(])(?:sh|bash|zsh|dash|cmd(?:\.exe)?|pwsh|powershell(?:\.exe)?|env|command|exec|xargs|nohup|time|nice|sudo|wsl|foreach)\b[^\n]*?["'\s])` +
+    String.raw`git(?:\.exe)?["']?(?:\s+-[Cc]\s+\S+|\s+-\S+)*\s+(?:commit|push)\b`,
+  'i',
+)
+const SHIPS = ['commit', 'push']
 
 export const register: Register = (on, options) => {
   SKIP = allowedRules(options.allowedRules)
@@ -564,21 +578,28 @@ export const register: Register = (on, options) => {
           )
         if (touchesGuard(cmd)) return deny($, TAMPER)
         const cwd = await $.session.cwd()
-        const calls = /\bgit(?:\.exe)?\b/i.test(cmd) ? gitCalls(cmd, cwd) : []
-        if (WRAPPED_GIT.test(cmd) && !calls.some((c) => ['commit', 'push'].includes(c.action)))
-          return deny($, 'ejecuta git commit/push directamente, sin envolverlo en otro comando (sh -c, env, xargs…).')
+        // Read-only git (status, log, diff…) needs no inspection at all, whatever its options.
+        const calls = (/\bgit(?:\.exe)?\b/i.test(cmd) ? gitCalls(cmd, cwd) : []).filter((c) => !isNonShipping(c.action))
+        if (SHIPPING_AT_COMMAND.test(cmd) && !calls.some((c) => SHIPS.includes(c.action)))
+          return deny(
+            $,
+            'no he podido interpretar este git commit/push; ejecútalo directamente (git push …), sin envolverlo en otro comando.',
+          )
         if (calls.length || isDeploy(cmd)) await busy($, 'revisando lo que se va a enviar')
-        if (calls.length > 1 && calls.some((c) => ['commit', 'push'].includes(c.action)))
+        if (calls.length > 1 && calls.some((c) => SHIPS.includes(c.action)))
           return deny(
             $,
             'separa las operaciones Git en llamadas distintas para revisar el estado que realmente se enviará.',
           )
         const problems: string[] = []
         for (const call of calls) {
+          // A commit or push (or an alias that may be one) we could not follow is refused.
+          if (call.problem) throw new Error(call.problem)
           let action = call.action
           let args = call.args
-          // Git aliases only; shell aliases/functions remain outside this parser.
-          for (let depth = 0; depth < 5; depth++) {
+          // Git aliases only (git ignores aliases named like built-in commands); shell
+          // aliases/functions remain outside this parser.
+          for (let depth = 0; depth < 5 && !SHIPS.includes(action); depth++) {
             const alias = await git($, call.cwd, ['config', '--get', 'alias.' + action])
             if (alias.exitCode === 1) break
             if (alias.exitCode !== 0 || alias.isStdoutTruncated) throw new Error('Cannot resolve Git alias')
