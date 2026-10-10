@@ -65,14 +65,78 @@ let SKIP: Skip = new Set()
 const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_OPTIONAL_LOCKS: '0' }
 const GIT_SAFE = ['-c', 'core.fsmonitor=false']
 
-// `$` calls do not count against the hook budget: these bound slow or stuck git, not the hook.
-const git = ($: $, cwd: string | undefined, args: string[], init: { stdin?: string; timeoutMs?: number } = {}) =>
-  $.process.run(['git', ...GIT_SAFE, ...args], {
+type GitInit = { stdin?: string; timeoutMs?: number }
+type GitResult = Awaited<ReturnType<$['process']['run']>>
+const CAP = 4 * 1024 * 1024
+// The engine itself failing to launch a process, as opposed to git running and failing.
+const START_FAILURE = /failed to start|#handle|no implementation/i
+
+/** The same run through the engine's streaming API, which launches processes by another path. */
+async function spawnGit($: $, argv: string[], cwd: string | undefined, init: GitInit): Promise<GitResult> {
+  const stream = $.process.spawn({
+    argv,
     ...(cwd ? { cwd } : {}),
     env: GIT_ENV,
-    timeoutMs: init.timeoutMs ?? 30_000,
-    ...(init.stdin === undefined ? {} : { stdin: init.stdin }),
+    ...(init.stdin === undefined ? {} : { input: init.stdin }),
   })
+  let timedOut = false
+  let timer: { cancel: () => void } | undefined
+  try {
+    timer = $.clock.after(init.timeoutMs ?? 30_000, () => {
+      timedOut = true
+      void stream.return(undefined as never)
+    })
+  } catch {
+    /* No clock: the child still ends with its own exit. */
+  }
+  let stdout = ''
+  let stderr = ''
+  try {
+    for (;;) {
+      const piece = await stream.next()
+      if (piece.done) {
+        if (timedOut) throw new Error('git timed out')
+        return {
+          exitCode: piece.value?.code ?? 1,
+          stdout: stdout.slice(0, CAP),
+          stderr: stderr.slice(0, CAP),
+          isStdoutTruncated: stdout.length > CAP,
+          isStderrTruncated: stderr.length > CAP,
+        }
+      }
+      if (piece.value.stream === 'stdout') stdout += piece.value.text
+      else stderr += piece.value.text
+      if (stdout.length > CAP && stderr.length > CAP) void stream.return(undefined as never)
+    }
+  } finally {
+    timer?.cancel()
+  }
+}
+
+// `$` calls do not count against the hook budget: these bound slow or stuck git, not the hook.
+async function git($: $, cwd: string | undefined, args: string[], init: GitInit = {}): Promise<GitResult> {
+  const argv = ['git', ...GIT_SAFE, ...args]
+  try {
+    return await $.process.run(argv, {
+      ...(cwd ? { cwd } : {}),
+      env: GIT_ENV,
+      timeoutMs: init.timeoutMs ?? 30_000,
+      ...(init.stdin === undefined ? {} : { stdin: init.stdin }),
+    })
+  } catch (error) {
+    const why = String((error as Error)?.message ?? error)
+    if (!START_FAILURE.test(why)) throw error
+    // A session whose process launcher broke (seen after plugin reloads: `this.#handle`) can
+    // still launch through spawn. If that fails too, say what it is and how to get out of it.
+    try {
+      return await spawnGit($, argv, cwd, init)
+    } catch {
+      throw new Error(
+        `Claude Code no consigue arrancar procesos en esta sesión (${why.slice(0, 120)}); no es un fallo de git ni de tu repo. Abre una sesión nueva y repite la operación.`,
+      )
+    }
+  }
+}
 
 /** Git metadata must be complete before it can authorize an action. */
 async function checkedGit($: $, cwd: string | undefined, args: string[], timeoutMs?: number) {
@@ -369,7 +433,7 @@ async function failed($: EngineInterface, e: ObservedCall, error?: unknown) {
     /* Error reporting cannot weaken a denial. */
   }
   // Say why, so the person can fix the cause (a timeout, a missing repo); masked and bounded.
-  const why = error instanceof Error ? redact(error.message, SKIP).text.slice(0, 200) : ''
+  const why = error instanceof Error ? redact(error.message, SKIP).text.slice(0, 400) : ''
   return why ? { deny: `${UNCHECKED.deny} Motivo: ${why}` } : UNCHECKED
 }
 
